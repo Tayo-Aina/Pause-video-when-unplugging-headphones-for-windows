@@ -64,7 +64,23 @@ namespace EarphonePause
         // VLC HTTP interface password (user should set this to match their VLC config)
         private const string VlcHttpPassword = "vlcremote";
 
+        // VLC HTTP client, created once. Short timeout: localhost either answers
+        // fast or the web interface isn't enabled at all.
+        private static readonly HttpClient VlcHttpClient = CreateVlcHttpClient();
+
         private static readonly string LogPath = GetLogPath();
+
+        // --- GSMTC session manager cache ---
+        // RequestAsync() is relatively expensive (measured ~15-60 ms), so the
+        // manager is created once, pre-warmed at startup, and reused. It is
+        // re-created if it failed or returned null.
+        private static Task<GlobalSystemMediaTransportControlsSessionManager?>? _sessionManagerTask;
+        private static readonly object _sessionManagerLock = new();
+
+        // --- Non-blocking log writer ---
+        private static readonly BlockingCollection<string> LogQueue = new(new ConcurrentQueue<string>());
+        private static volatile bool _logWriterStarted;
+        private static Thread? _logWriterThread;
 
         static string GetLogPath()
         {
@@ -98,12 +114,19 @@ namespace EarphonePause
                 return;
             }
 
+            StartLogWriter();
+
             try
             {
                 Log("=== EarphonePause started ===");
                 Log($"Process ID: {Environment.ProcessId}");
                 Log($"Next scheduled restart in {RestartInterval.TotalHours} hours.");
                 _mainThreadId = GetCurrentThreadId();
+
+                // Pre-warm the GSMTC session manager on a background thread so the
+                // first unplug is as fast as every later one.
+                _ = GetSessionManagerTask();
+                Log("GSMTC session manager pre-warm requested.");
 
                 var enumerator = new MMDeviceEnumerator();
                 var client = new AudioNotificationClient();
@@ -135,6 +158,7 @@ namespace EarphonePause
             }
             finally
             {
+                ShutdownLogWriter();
                 try { _mutex?.ReleaseMutex(); } catch { }
                 _mutex?.Dispose();
                 _mutex = null;
@@ -177,22 +201,69 @@ namespace EarphonePause
         }
 
         /// <summary>
-        /// Context-aware pause using Windows GSMTC (Global System Media Transport Controls).
+        /// Pauses all currently playing media, running the SMTC pause and the VLC
+        /// fallback concurrently so neither path can delay the other.
         /// Only pauses sessions that are CURRENTLY PLAYING — never toggles paused media back on.
         /// Uses TryPauseAsync() which sends a dedicated PAUSE command, not a play/pause toggle.
         /// Works with Spotify, browsers, and any app that registers with SMTC.
         /// For VLC (which doesn't register with SMTC), a separate fallback is used.
+        /// Returns true if at least one media session was paused (or a VLC pause was sent).
         /// </summary>
-        public static async Task PausePlayingMediaAsync()
+        public static async Task<bool> PausePlayingMediaAsync()
+        {
+            var smtcTask = PauseSmtcSessionsAsync();
+            var vlcTask = PauseVlcAsync();
+
+            bool[] results = await Task.WhenAll(smtcTask, vlcTask);
+            return results[0] || results[1];
+        }
+
+        /// <summary>
+        /// Returns the cached GSMTC session manager task, creating it if it failed,
+        /// was reset, or produced null.
+        /// </summary>
+        static Task<GlobalSystemMediaTransportControlsSessionManager?> GetSessionManagerTask()
+        {
+            lock (_sessionManagerLock)
+            {
+                if (_sessionManagerTask == null ||
+                    _sessionManagerTask.IsFaulted ||
+                    (_sessionManagerTask.IsCompletedSuccessfully && _sessionManagerTask.Result == null))
+                {
+                    _sessionManagerTask = Task.Run<GlobalSystemMediaTransportControlsSessionManager?>(async () =>
+                        await GlobalSystemMediaTransportControlsSessionManager.RequestAsync());
+                }
+                return _sessionManagerTask;
+            }
+        }
+
+        /// <summary>
+        /// Drops the cached session manager so the next pause re-requests it.
+        /// Called when a GSMTC call throws (e.g. after the media stack restarts).
+        /// </summary>
+        static void ResetSessionManagerCache()
+        {
+            lock (_sessionManagerLock)
+            {
+                _sessionManagerTask = null;
+            }
+        }
+
+        static async Task<bool> PauseSmtcSessionsAsync()
         {
             try
             {
-                var sessionManager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
-                var sessions = sessionManager.GetSessions();
-                int pausedCount = 0;
+                var sessionManager = await GetSessionManagerTask();
+                if (sessionManager == null)
+                {
+                    Log("  GSMTC: session manager unavailable.");
+                    return false;
+                }
 
+                var sessions = sessionManager.GetSessions();
                 Log($"  Found {sessions.Count} SMTC media session(s).");
 
+                var pauseTasks = new List<Task<bool>>();
                 foreach (var session in sessions)
                 {
                     string appId = session.SourceAppUserModelId ?? "unknown";
@@ -203,9 +274,7 @@ namespace EarphonePause
 
                         if (status == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
                         {
-                            bool result = await session.TryPauseAsync();
-                            Log($"  ✓ Paused '{appId}' (was Playing) — success: {result}");
-                            pausedCount++;
+                            pauseTasks.Add(PauseSessionSafeAsync(session, appId));
                         }
                         else
                         {
@@ -218,74 +287,97 @@ namespace EarphonePause
                     }
                 }
 
-                if (pausedCount == 0)
+                if (pauseTasks.Count == 0)
+                {
                     Log("  No SMTC sessions were actively playing.");
-                else
-                    Log($"  Paused {pausedCount} SMTC session(s).");
+                    return false;
+                }
+
+                // Pause all playing sessions in parallel
+                bool[] results = await Task.WhenAll(pauseTasks);
+                int pausedCount = results.Count(p => p);
+                Log($"  Paused {pausedCount} of {pauseTasks.Count} SMTC session(s).");
+                return pausedCount > 0;
             }
             catch (Exception ex)
             {
                 Log($"  GSMTC error: {ex.Message}");
+                ResetSessionManagerCache();
+                return false;
             }
+        }
 
-            // VLC fallback — VLC doesn't register with SMTC
-            await PauseVlcAsync();
+        static async Task<bool> PauseSessionSafeAsync(
+            GlobalSystemMediaTransportControlsSession session, string appId)
+        {
+            try
+            {
+                bool result = await session.TryPauseAsync();
+                Log($"  ✓ Paused '{appId}' (was Playing) — success: {result}");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Log($"  ✗ Error pausing '{appId}': {ex.Message}");
+                return false;
+            }
         }
 
         /// <summary>
         /// Pauses VLC media player using a multi-layer approach:
         /// Layer 1: HTTP interface with pl_forcepause (dedicated pause, not toggle)
         /// Layer 2: WM_APPCOMMAND sent to VLC window (fallback)
+        /// Returns true if a VLC pause was performed or sent.
         /// </summary>
-        static async Task PauseVlcAsync()
+        static async Task<bool> PauseVlcAsync()
         {
-            var vlcProcesses = Process.GetProcessesByName("vlc");
+            Process[] vlcProcesses;
+            try
+            {
+                vlcProcesses = Process.GetProcessesByName("vlc");
+            }
+            catch (Exception ex)
+            {
+                Log($"  VLC: process check failed: {ex.Message}");
+                return false;
+            }
+
             if (vlcProcesses.Length == 0)
             {
                 Log("  VLC: not running, skipped.");
-                return;
+                return false;
             }
 
             Log($"  VLC: detected {vlcProcesses.Length} instance(s). Attempting pause...");
 
             // Layer 1: VLC HTTP interface with pl_forcepause (best — dedicated pause)
             bool httpPaused = await TryPauseVlcHttpAsync();
-            if (httpPaused) return;
+            if (httpPaused) return true;
 
             // Layer 2: Send WM_APPCOMMAND to VLC window
-            TryPauseVlcWindowMessage(vlcProcesses);
+            return TryPauseVlcWindowMessage(vlcProcesses);
         }
 
         /// <summary>
         /// Attempts to pause VLC via its HTTP web interface.
-        /// Uses pl_forcepause which is a dedicated pause (does nothing if already paused).
+        /// Uses pl_forcepause, a dedicated pause that does nothing if already paused,
+        /// so no status pre-check is needed — one request instead of two.
         /// Requires VLC to have the Web interface enabled with password set to VlcHttpPassword.
         /// </summary>
         static async Task<bool> TryPauseVlcHttpAsync()
         {
             try
             {
-                using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(1) };
-                var auth = Convert.ToBase64String(Encoding.ASCII.GetBytes($":{VlcHttpPassword}"));
-                client.DefaultRequestHeaders.Authorization =
-                    new AuthenticationHeaderValue("Basic", auth);
+                using var response = await VlcHttpClient.GetAsync(
+                    "http://127.0.0.1:8080/requests/status.xml?command=pl_forcepause");
 
-                // Check current state first
-                var statusResponse = await client.GetStringAsync(
-                    "http://127.0.0.1:8080/requests/status.xml");
-
-                if (statusResponse.Contains("<state>playing</state>"))
+                if (response.IsSuccessStatusCode)
                 {
-                    await client.GetAsync(
-                        "http://127.0.0.1:8080/requests/status.xml?command=pl_forcepause");
-                    Log("  ✓ VLC: Paused via HTTP pl_forcepause (was Playing)");
+                    Log("  ✓ VLC: Paused via HTTP pl_forcepause.");
                     return true;
                 }
-                else
-                {
-                    Log("  – VLC: HTTP reports not playing, skipped.");
-                    return true; // Successfully checked — VLC isn't playing, no action needed
-                }
+
+                Log($"  – VLC: HTTP request rejected ({(int)response.StatusCode}).");
             }
             catch (TaskCanceledException)
             {
@@ -306,9 +398,11 @@ namespace EarphonePause
         /// <summary>
         /// Fallback: Sends WM_APPCOMMAND with APPCOMMAND_MEDIA_PAUSE to VLC's main window.
         /// Note: VLC may or may not respond to this depending on version and configuration.
+        /// Returns true if the message was sent to at least one VLC window.
         /// </summary>
-        static void TryPauseVlcWindowMessage(Process[] vlcProcesses)
+        static bool TryPauseVlcWindowMessage(Process[] vlcProcesses)
         {
+            bool anySent = false;
             try
             {
                 foreach (var proc in vlcProcesses)
@@ -326,6 +420,7 @@ namespace EarphonePause
                         {
                             SendMessage(mainWindow, WM_APPCOMMAND, mainWindow, APPCOMMAND_MEDIA_PAUSE_LPARAM);
                             Log($"  ✓ VLC: Sent APPCOMMAND_MEDIA_PAUSE to window 0x{mainWindow:X}");
+                            anySent = true;
                         }
                         else
                         {
@@ -342,6 +437,7 @@ namespace EarphonePause
             {
                 Log($"  ✗ VLC: Fallback failed: {ex.Message}");
             }
+            return anySent;
         }
 
         /// <summary>
@@ -370,30 +466,124 @@ namespace EarphonePause
             return found;
         }
 
+        /// <summary>
+        /// Writes a log line. When the background writer is running the line is
+        /// queued (no file I/O on the caller's thread); otherwise it is written
+        /// directly. Callers are typically COM callback threads, so this stays
+        /// non-blocking.
+        /// </summary>
         public static void Log(string message)
         {
             try
             {
                 string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}";
-                File.AppendAllText(LogPath, line + Environment.NewLine);
+                if (_logWriterStarted)
+                    LogQueue.Add(line);
+                else
+                    AppendLineDirect(line);
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Writes a single line with sharing compatible with the running
+        /// instance's open log handle (which cannot be opened via the
+        /// File.AppendAllText default share mode).
+        /// </summary>
+        static void AppendLineDirect(string line)
+        {
+            try
+            {
+                using var stream = new FileStream(LogPath, FileMode.Append, FileAccess.Write,
+                    FileShare.ReadWrite | FileShare.Delete);
+                using var writer = new StreamWriter(stream);
+                writer.WriteLine(line);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Starts a single background thread that owns the log file.
+        /// Keeps file I/O off the audio-event callback threads.
+        /// </summary>
+        static void StartLogWriter()
+        {
+            _logWriterStarted = true;
+            _logWriterThread = new Thread(() =>
+            {
+                try
+                {
+                    using var writer = new StreamWriter(
+                        new FileStream(LogPath, FileMode.Append, FileAccess.Write,
+                            FileShare.ReadWrite | FileShare.Delete))
+                    {
+                        AutoFlush = true
+                    };
+
+                    foreach (string line in LogQueue.GetConsumingEnumerable())
+                    {
+                        try { writer.WriteLine(line); } catch { }
+                    }
+                }
+                catch { }
+            })
+            {
+                IsBackground = true,
+                Name = "EarphonePauseLogWriter"
+            };
+            _logWriterThread.Start();
+        }
+
+        /// <summary>
+        /// Flushes any queued log lines and stops the writer thread.
+        /// </summary>
+        static void ShutdownLogWriter()
+        {
+            try
+            {
+                if (!_logWriterStarted) return;
+                LogQueue.CompleteAdding();
+                _logWriterThread?.Join(TimeSpan.FromSeconds(1));
+            }
+            catch { }
+        }
+
+        static HttpClient CreateVlcHttpClient()
+        {
+            var client = new HttpClient { Timeout = TimeSpan.FromMilliseconds(400) };
+            var auth = Convert.ToBase64String(Encoding.ASCII.GetBytes($":{VlcHttpPassword}"));
+            client.DefaultRequestHeaders.Authorization =
+                new AuthenticationHeaderValue("Basic", auth);
+            return client;
         }
 
         static void TrimLogFile()
         {
             try
             {
-                if (File.Exists(LogPath))
+                if (!File.Exists(LogPath)) return;
+                var fi = new FileInfo(LogPath);
+                if (fi.Length <= 1_048_576) return; // not over 1 MB
+
+                // Read with sharing compatible with a running instance's log handle
+                var lines = new List<string>();
+                using (var stream = new FileStream(LogPath, FileMode.Open, FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete))
+                using (var reader = new StreamReader(stream))
                 {
-                    var fi = new FileInfo(LogPath);
-                    if (fi.Length > 1_048_576) // > 1 MB
-                    {
-                        // Keep the last 200 lines
-                        var lines = File.ReadAllLines(LogPath);
-                        int keep = Math.Min(200, lines.Length);
-                        File.WriteAllLines(LogPath, lines[^keep..]);
-                    }
+                    string? line;
+                    while ((line = reader.ReadLine()) != null)
+                        lines.Add(line);
+                }
+
+                // Keep the last 200 lines
+                int keep = Math.Min(200, lines.Count);
+                using (var stream = new FileStream(LogPath, FileMode.Create, FileAccess.Write,
+                    FileShare.ReadWrite | FileShare.Delete))
+                using (var writer = new StreamWriter(stream))
+                {
+                    for (int i = lines.Count - keep; i < lines.Count; i++)
+                        writer.WriteLine(lines[i]);
                 }
             }
             catch { }
@@ -403,6 +593,7 @@ namespace EarphonePause
     class AudioNotificationClient : IMMNotificationClient
     {
         private DateTime _lastPause = DateTime.MinValue;
+        private volatile bool _lastAttemptFoundNothing = true;
         private readonly object _lock = new object();
 
         // Track recently-activated devices to distinguish plug-in from unplug events
@@ -413,7 +604,14 @@ namespace EarphonePause
             lock (_lock)
             {
                 var elapsed = (DateTime.Now - _lastPause).TotalMilliseconds;
-                if (elapsed < 2000) // 2-second debounce window
+
+                // Normal debounce is 2 seconds. But if the last attempt found
+                // nothing playing (media sessions often register a few hundred ms
+                // into the unplug event burst), allow a fast re-check after 500 ms
+                // so a late-arriving session doesn't keep playing until the next event.
+                bool fastRetry = _lastAttemptFoundNothing && elapsed >= 500;
+
+                if (elapsed < 2000 && !fastRetry)
                 {
                     Program.Log($"  (debounced, {elapsed:F0}ms since last) {reason}");
                     return;
@@ -423,7 +621,11 @@ namespace EarphonePause
 
             Program.Log($"→ Pause triggered: {reason}");
             // Run async pause on a thread pool thread (we're on a COM callback thread)
-            Task.Run(() => Program.PausePlayingMediaAsync());
+            Task.Run(async () =>
+            {
+                bool pausedSomething = await Program.PausePlayingMediaAsync();
+                _lastAttemptFoundNothing = !pausedSomething;
+            });
         }
 
         /// <summary>

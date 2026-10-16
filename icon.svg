@@ -1,1 +1,12 @@
-PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPgogIDwhLS0gSGVhZGJhbmQgYXJjIC0tPgogIDxwYXRoIGQ9Ik01IDkgQzUgMiAxOSAyIDE5IDkiIC8+CiAgPCEtLSBMZWZ0IGVhciBjdXAgLS0+CiAgPHJlY3QgeD0iMyIgeT0iOSIgd2lkdGg9IjQiIGhlaWdodD0iNiIgcng9IjEuNSIgLz4KICA8IS0tIFJpZ2h0IGVhciBjdXAgLS0+CiAgPHJlY3QgeD0iMTciIHk9IjkiIHdpZHRoPSI0IiBoZWlnaHQ9IjYiIHJ4PSIxLjUiIC8+CiAgPCEtLSBDYWJsZSBmcm9tIGxlZnQgZWFyIGN1cCAtLT4KICA8bGluZSB4MT0iNSIgeTE9IjE1IiB4Mj0iNSIgeTI9IjE2LjUiIC8+CiAgPCEtLSAzLjVtbSBqYWNrIHBsdWcg4oCUIGRpc2Nvbm5lY3RlZCAodmlzaWJsZSBnYXAgYWJvdmUpIC0tPgogIDxyZWN0IHg9IjQiIHk9IjE5LjUiIHdpZHRoPSIyIiBoZWlnaHQ9IjEuNSIgcng9IjAuNzUiIC8+Cjwvc3ZnPgo=
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Headband arc -->
+  <path d="M5 9 C5 2 19 2 19 9" />
+  <!-- Left ear cup -->
+  <rect x="3" y="9" width="4" height="6" rx="1.5" />
+  <!-- Right ear cup -->
+  <rect x="17" y="9" width="4" height="6" rx="1.5" />
+  <!-- Cable from left ear cup -->
+  <line x1="5" y1="15" x2="5" y2="16.5" />
+  <!-- 3.5mm jack plug — disconnected (visible gap above) -->
+  <rect x="4" y="19.5" width="2" height="1.5" rx="0.75" />
+</svg>
